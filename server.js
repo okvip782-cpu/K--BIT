@@ -17,10 +17,12 @@ const hosts = {
 
 // ฟังก์ชันกระจายข่าวบอกพนักงานว่าแต่ละเครื่องสถานะเป็นยังไง
 function broadcastLiveStatus() {
-    io.emit('live_queue_status', {
-        kbiz_1: { count: hosts['kbiz_1'].queue.length, isProcessing: hosts['kbiz_1'].isBusy, isOnline: !!hosts['kbiz_1'].socketId },
-        kbiz_2: { count: hosts['kbiz_2'].queue.length, isProcessing: hosts['kbiz_2'].isBusy, isOnline: !!hosts['kbiz_2'].socketId }
-    });
+    try {
+        io.emit('live_queue_status', {
+            kbiz_1: { count: hosts['kbiz_1'].queue.length, isProcessing: hosts['kbiz_1'].isBusy, isOnline: !!hosts['kbiz_1'].socketId },
+            kbiz_2: { count: hosts['kbiz_2'].queue.length, isProcessing: hosts['kbiz_2'].isBusy, isOnline: !!hosts['kbiz_2'].socketId }
+        });
+    } catch (e) { console.error("Error broadcast:", e); }
 }
 
 io.on('connection', (socket) => {
@@ -28,8 +30,12 @@ io.on('connection', (socket) => {
 
     // 🌟 รับลงทะเบียนบอส ระบุตัวตนว่าเป็นเครื่องไหน
     socket.on('register', (data) => {
-        if (data.role === 'host') {
-            const hostId = data.hostId; // 'kbiz_1' หรือ 'kbiz_2'
+        try {
+            // 🛡️ เกราะป้องกัน: รองรับส่วนขยายบอสเวอร์ชันเก่า
+            if (data === 'host') data = { role: 'host', hostId: 'kbiz_1' }; 
+            if (!data || data.role !== 'host') return;
+
+            const hostId = data.hostId || 'kbiz_1'; // ถ้าไม่บอกว่าเครื่องไหน ให้ถือว่าเป็นเครื่อง 1
             if (hosts[hostId]) {
                 hosts[hostId].socketId = socket.id;
                 hosts[hostId].isBusy = false;
@@ -37,68 +43,78 @@ io.on('connection', (socket) => {
                 console.log(`🟢 บอส [${hostId}] ออนไลน์พร้อมรับงาน`);
                 broadcastLiveStatus();
             }
-        }
+        } catch (e) { console.error("Error register:", e); }
     });
 
     // เมื่อพนักงานส่งคำสั่งค้นหา
     socket.on('request_check', (data) => {
-        const system = data.system; // 'kbiz_1' หรือ 'kbiz_2'
-        const host = hosts[system];
+        try {
+            if (!data) return;
+            // 🛡️ เกราะป้องกัน: ถ้ารับคำสั่งจากลูกน้องที่ไม่ได้อัปเดต โยนให้เครื่อง 1 ทำ
+            const system = data.system || 'kbiz_1'; 
+            const host = hosts[system];
 
-        if (!host || !host.socketId) {
-            return socket.emit('check_result', { status: 'error', message: `❌ เครื่อง ${system === 'kbiz_1' ? '1' : '2'} ออฟไลน์อยู่!` });
-        }
+            if (!host || !host.socketId) {
+                return socket.emit('check_result', { status: 'error', message: `❌ เครื่อง ${system === 'kbiz_1' ? '1' : '2'} ออฟไลน์อยู่!` });
+            }
 
-        const requestData = { workerId: socket.id, bankName: data.bankName, accNo: data.accNo, system: system };
+            const requestData = { workerId: socket.id, bankName: data.bankName, accNo: data.accNo, system: system };
 
-        if (host.isBusy) {
-            host.queue.push(requestData);
-            socket.emit('queue_status', { position: host.queue.length });
-            broadcastLiveStatus();
-        } else {
-            host.isBusy = true;
-            socket.emit('queue_status', { position: 0 });
-            io.to(host.socketId).emit('do_check', requestData);
-            broadcastLiveStatus();
-        }
+            if (host.isBusy) {
+                host.queue.push(requestData);
+                socket.emit('queue_status', { position: host.queue.length });
+                broadcastLiveStatus();
+            } else {
+                host.isBusy = true;
+                socket.emit('queue_status', { position: 0 });
+                io.to(host.socketId).emit('do_check', requestData);
+                broadcastLiveStatus();
+            }
+        } catch (e) { console.error("Error request_check:", e); }
     });
 
     // เมื่อบอสทำงานเสร็จ
     socket.on('send_result', (data) => {
-        const system = data.system;
-        const host = hosts[system];
-        
-        io.to(data.workerId).emit('check_result', data.result);
+        try {
+            if (!data) return;
+            // 🛡️ เกราะป้องกัน: ถ้าบอสส่งข้อมูลมาไม่ครบ
+            const system = data.system || 'kbiz_1';
+            const host = hosts[system];
+            
+            if (data.workerId) io.to(data.workerId).emit('check_result', data.result);
 
-        if (host && host.queue.length > 0) {
-            const nextRequest = host.queue.shift();
-            host.queue.forEach((req, index) => {
-                io.to(req.workerId).emit('queue_status', { position: index + 1 });
-            });
-            io.to(nextRequest.workerId).emit('queue_status', { position: 0 });
-            io.to(host.socketId).emit('do_check', nextRequest);
-        } else if (host) {
-            host.isBusy = false;
-        }
-        broadcastLiveStatus();
+            if (host && host.queue.length > 0) {
+                const nextRequest = host.queue.shift();
+                host.queue.forEach((req, index) => {
+                    io.to(req.workerId).emit('queue_status', { position: index + 1 });
+                });
+                io.to(nextRequest.workerId).emit('queue_status', { position: 0 });
+                io.to(host.socketId).emit('do_check', nextRequest);
+            } else if (host) {
+                host.isBusy = false;
+            }
+            broadcastLiveStatus();
+        } catch (e) { console.error("Error send_result:", e); }
     });
 
     // เมื่อบอสหรือพนักงานปิดหน้าต่าง
     socket.on('disconnect', () => {
-        for (let hostId in hosts) {
-            if (hosts[hostId].socketId === socket.id) {
-                hosts[hostId].socketId = null;
-                hosts[hostId].isBusy = false;
-                hosts[hostId].queue = [];
-                console.log(`🔴 บอส [${hostId}] ออฟไลน์`);
-                broadcastLiveStatus();
-            } else {
-                // เคลียร์คิวของพนักงานที่ปิดหน้าต่างหนี
-                const initialLen = hosts[hostId].queue.length;
-                hosts[hostId].queue = hosts[hostId].queue.filter(req => req.workerId !== socket.id);
-                if (hosts[hostId].queue.length !== initialLen) broadcastLiveStatus();
+        try {
+            for (let hostId in hosts) {
+                if (hosts[hostId].socketId === socket.id) {
+                    hosts[hostId].socketId = null;
+                    hosts[hostId].isBusy = false;
+                    hosts[hostId].queue = [];
+                    console.log(`🔴 บอส [${hostId}] ออฟไลน์`);
+                    broadcastLiveStatus();
+                } else {
+                    // เคลียร์คิวของพนักงานที่ปิดหน้าต่างหนี
+                    const initialLen = hosts[hostId].queue.length;
+                    hosts[hostId].queue = hosts[hostId].queue.filter(req => req.workerId !== socket.id);
+                    if (hosts[hostId].queue.length !== initialLen) broadcastLiveStatus();
+                }
             }
-        }
+        } catch (e) { console.error("Error disconnect:", e); }
     });
 });
 
