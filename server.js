@@ -13,12 +13,24 @@ let hostSocketId = null;
 let isHostBusy = false; // ตัวเช็คว่าบอสทำงานอยู่ไหม
 let queue = []; // แถวเข้าคิว
 
+// 🌟 ฟังก์ชันใหม่: กระจายข่าวบอกพนักงานทุกคนว่าคิวว่างหรือติดคิวกี่คนแบบ Real-time
+function broadcastLiveStatus() {
+    io.emit('live_queue_status', { 
+        count: queue.length, 
+        isProcessing: isHostBusy 
+    });
+}
+
 io.on('connection', (socket) => {
+    // 🌟 พอพนักงานเปิดส่วนขยายปุ๊บ ส่งบอกทันทีว่าคิวเท่าไหร่
+    socket.emit('live_queue_status', { count: queue.length, isProcessing: isHostBusy });
+
     socket.on('register', (role) => {
         if (role === 'host') {
             hostSocketId = socket.id;
             isHostBusy = false;
             queue = [];
+            broadcastLiveStatus(); // แจ้งทุกคนว่าบอสพร้อมรับงานแล้ว
         }
     });
 
@@ -28,17 +40,19 @@ io.on('connection', (socket) => {
             return socket.emit('check_result', { status: 'error', message: '❌ บอส (Host) ออฟไลน์' });
         }
 
-        const requestData = { workerId: socket.id, bankName: data.bankName, accNo: data.accNo };
+        const requestData = { workerId: socket.id, bankName: data.bankName, accNo: data.accNo, system: data.system };
 
         if (isHostBusy) {
             // ถ้าบอสไม่ว่าง จับเข้าคิว
             queue.push(requestData);
             socket.emit('queue_status', { position: queue.length }); // แจ้งพนักงานว่าติดคิวที่เท่าไหร่
+            broadcastLiveStatus(); // 🌟 อัปเดตตัวเลขคิวสีแดงให้ทุกคนเห็น
         } else {
             // ถ้าบอสว่าง โยนงานให้เลย
             isHostBusy = true;
             socket.emit('queue_status', { position: 0 }); // 0 = ไม่ติดคิว กำลังดึงข้อมูล
             io.to(hostSocketId).emit('do_check', requestData);
+            broadcastLiveStatus(); // 🌟 อัปเดตว่าตอนนี้บอสกำลังทำงาน (ไม่ว่างแล้ว)
         }
     });
 
@@ -59,6 +73,8 @@ io.on('connection', (socket) => {
         } else {
             isHostBusy = false; // บอสว่างแล้ว
         }
+        
+        broadcastLiveStatus(); // 🌟 อัปเดตสถานะคิวล่าสุดหลังจบงาน (หรือป้ายกลับเป็นสีเขียวถ้าคิวว่าง)
     });
 
     socket.on('disconnect', () => {
@@ -66,9 +82,14 @@ io.on('connection', (socket) => {
             hostSocketId = null;
             isHostBusy = false;
             queue = [];
+            broadcastLiveStatus(); // 🌟 บอสหลุด รีเซ็ตคิวทั้งหมด
         } else {
             // ถ้าพนักงานออกไปก่อน คัดออกจากคิว
+            const initialLength = queue.length;
             queue = queue.filter(req => req.workerId !== socket.id);
+            if (queue.length !== initialLength) {
+                broadcastLiveStatus(); // 🌟 อัปเดตตัวเลขคิวถ้ามีคนกดยกเลิก/ปิดหน้าต่างไปก่อน
+            }
         }
     });
 });
